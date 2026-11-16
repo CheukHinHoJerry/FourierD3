@@ -172,8 +172,12 @@ class MACEFourierD3Calculator(MACECalculator):
     def _pad_edges(self, edge_index, unit_shifts):
         """Pad to a fixed capacity with zero-shift self-pairs (0, 0).
 
-        A zero-distance pair is excluded by the CN mask (r > 1e-6), so padding
-        contributes exactly zero. Growing the capacity drops the captured graph.
+        Edges are only consumed by the coordination numbers; the dispersion
+        energy itself is a k-space sum and never sees the edge list. In the CN a
+        zero-distance pair is excluded by the mask (r > 1e-6) and its distance is
+        clamped before any division, so padding adds exactly zero to the energy
+        and a finite, zero contribution to the forces. Growing the capacity drops
+        the compiled wrapper.
         """
         n_edges = edge_index.shape[1]
         if self._edge_capacity is None or n_edges > self._edge_capacity:
