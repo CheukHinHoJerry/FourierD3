@@ -241,6 +241,18 @@ class FourierD3(torch.nn.Module):
             self.register_buffer('knorm', knorm)
             self.register_buffer('G', G)
 
+    def _apply(self, fn, *args, **kwargs):
+        # .to()/.double()/.cuda() transform the cell-dependent buffers; force the next
+        # _update_cell to rebuild instead of trusting the cached cell.
+        self._last_cell = None
+        return super()._apply(fn, *args, **kwargs)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # Loaded buffers may belong to a different cell; called for this module also
+        # when a parent module's state dict is loaded.
+        self._last_cell = None
+        super()._load_from_state_dict(*args, **kwargs)
+
     def _update_cell(self, cell):
         """Update the simulation cell and refresh all cell-dependent buffers.
 
@@ -248,9 +260,24 @@ class FourierD3(torch.nn.Module):
         Recomputes the cell volume, mesh interpolation weights, k-space filters,
         and (for Ewald) the k-vectors and Green's function values.
 
+        Calling it again with an identical cell (same values, dtype and device, no
+        autograd graph) is a no-op, so fixed-cell MD does not pay for the rebuild.
+        The cache is dropped on .to()/dtype/device changes and on load_state_dict.
+
         Args:
             cell: (3, 3) tensor in Ångström.
         """
+        # Skip the rebuild when the cell is exactly the one used last time. Only cells
+        # without an autograd graph are cached: a strained cell (stress via the strain
+        # trick) always rebuilds, and clears the cache so the next plain call rebuilds too.
+        if not cell.requires_grad:
+            last = getattr(self, "_last_cell", None)
+            if (last is not None and last.dtype == cell.dtype and last.device == cell.device
+                    and last.shape == cell.shape and torch.equal(last, cell)):
+                return
+        # Invalidate before rebuilding; the cache is only set once the rebuild succeeded.
+        self._last_cell = None
+
         self.cell = cell * self.angstrom_to_bohr
         self.volume = torch.abs(safe_det_3x3(self.cell))
         if self.method == 'pme' or self.method == 'spme':
@@ -265,6 +292,9 @@ class FourierD3(torch.nn.Module):
             self.G = self.potential.lr_from_k_sq(self.knorm)
             if self.cnfunc == 'd4':
                 self.G_cn = self.cn_potential.lr_from_k_sq(self.knorm)
+
+        if not cell.requires_grad:
+            self._last_cell = cell.detach().clone()
 
 
     @torch.jit.export

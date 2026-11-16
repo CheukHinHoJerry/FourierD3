@@ -170,21 +170,26 @@ class MACEFourierD3Calculator(MACECalculator):
         batch = self._cached_batch
         cnfunc = self.d3_kwargs.get('cnfunc', 'smooth_cut')
 
-        # Set up strained positions and cell for stress computation via autograd
+        # Stress needs the strain trick; energy and forces only need d/dpositions.
+        need_stress = "stress" in (properties or [])
+
         cell_d3 = batch["cell"].clone().detach().to(dtype=self.d3_model.dtype)
-
-        strain = torch.zeros(3, 3, dtype=self.d3_model.dtype, device=self.device)
-        strain.requires_grad_(True)
-
-        # Strained cell: cell' = cell + strain @ cell  (infinitesimal deformation)
-        strained_cell = cell_d3 + torch.einsum("ab,Ab->Aa", strain, cell_d3)
-        self.d3_model._update_cell(strained_cell)
-
         positions_d3 = batch["positions"].clone().detach().to(dtype=self.d3_model.dtype)
         positions_d3.requires_grad_(True)
 
-        # Apply the same strain to positions: pos' = pos + strain @ pos
-        strained_pos = positions_d3 + torch.einsum("ab,ib->ia", strain, positions_d3)
+        if need_stress:
+            # Strain tensor trick: d(energy)/d(strain) gives the stress tensor.
+            strain = torch.zeros(3, 3, dtype=self.d3_model.dtype, device=self.device)
+            strain.requires_grad_(True)
+            # Strained cell: cell' = cell + strain @ cell  (infinitesimal deformation)
+            cell_eval = cell_d3 + torch.einsum("ab,Ab->Aa", strain, cell_d3)
+            # Apply the same strain to positions: pos' = pos + strain @ pos
+            pos_eval = positions_d3 + torch.einsum("ab,ib->ia", strain, positions_d3)
+        else:
+            # No strain graph; _update_cell is a no-op when the cell is unchanged.
+            cell_eval = cell_d3
+            pos_eval = positions_d3
+        self.d3_model._update_cell(cell_eval)
 
         # Compute Fourier-D3 energy
         if cnfunc == 'smooth_cut':
@@ -197,31 +202,32 @@ class MACEFourierD3Calculator(MACECalculator):
                 edge_index, unit_shifts = self.neighbor_list.get(atoms)
                 unit_shifts = unit_shifts.to(dtype=self.d3_model.dtype)
 
-            strained_shifts = torch.matmul(unit_shifts, strained_cell)
-
             energy_hartree = self.d3_model(
-                positions=strained_pos,
+                positions=pos_eval,
                 edge_index=edge_index,
-                shifts=strained_shifts,
+                shifts=torch.matmul(unit_shifts, cell_eval),
             )
         elif cnfunc == 'd4':
             # D4 CN is computed entirely in k-space; no edge_index or shifts needed
-            energy_hartree = self.d3_model(positions=strained_pos)
+            energy_hartree = self.d3_model(positions=pos_eval)
         else:
             raise ValueError(f"Unknown cnfunc '{cnfunc}'. Expected 'smooth_cut' or 'd4'.")
 
         energy_ev = energy_hartree * self.HARTREE_TO_EV
 
-        # Backpropagate to get forces (dE/dpos) and stress (dE/dstrain)
-        energy_ev.backward()
+        if need_stress:
+            # Backpropagate to get forces (dE/dpos) and stress (dE/dstrain)
+            grad_pos, grad_strain = torch.autograd.grad(energy_ev, (positions_d3, strain))
+            # Stress tensor: (1/Omega) * dE/dstrain, converted from Bohr^3 to Å^3
+            d3_stress_3x3 = (
+                grad_strain
+                / self.d3_model.volume * (self.angstrom_to_bohr ** 3)
+            ).detach().cpu().numpy()
+        else:
+            (grad_pos,) = torch.autograd.grad(energy_ev, (positions_d3,))
+            d3_stress_3x3 = None
 
-        d3_forces = -positions_d3.grad.detach().cpu().numpy()
-
-        # Stress tensor: (1/Omega) * dE/dstrain, converted from Bohr^3 to Å^3
-        d3_stress_3x3 = (
-            strain.grad
-            / self.d3_model.volume * (self.angstrom_to_bohr ** 3)
-        ).detach().cpu().numpy()
+        d3_forces = -grad_pos.detach().cpu().numpy()
 
         # Add D3 contributions to the MACE results already stored in self.results
         d3_e = energy_ev.item()
@@ -232,7 +238,12 @@ class MACEFourierD3Calculator(MACECalculator):
         self.results["forces"] += d3_forces
 
         if "stress" in self.results:
-            d3_stress_voigt = full_3x3_to_voigt_6_stress(d3_stress_3x3)
-            self.results["stress"] += d3_stress_voigt
+            if d3_stress_3x3 is None:
+                # Stress was not requested, so its D3 part was not computed. Drop the
+                # MACE-only value so a later get_stress() recomputes the full stress.
+                del self.results["stress"]
+            else:
+                d3_stress_voigt = full_3x3_to_voigt_6_stress(d3_stress_3x3)
+                self.results["stress"] += d3_stress_voigt
 
         self._cached_batch = None
