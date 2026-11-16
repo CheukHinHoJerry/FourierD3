@@ -39,12 +39,27 @@ class MACEFourierD3Calculator(MACECalculator):
         delay:     never rebuild the fallback list until `delay` calls after the
                    last rebuild.
         check:     rebuild only when atoms may have left the buffer region.
+        compile_d3: opt-in. When stress is not requested and the cell has been unchanged
+                   for `stable_n` calls, run the D3 energy + forces as a compiled CUDA graph
+                   (torch.compile mode="reduce-overhead") on a fixed-capacity edge list.
+                   While the cell keeps changing (NPT) the eager path is used.
+        edge_capacity: initial padded edge-list size for compile_d3 (default: 1.25 x the
+                   first edge count). Grows automatically, which triggers one recapture.
+        stable_n:  unchanged-cell calls required before switching to the compiled path.
         **mace_kwargs: all other keyword arguments are forwarded to MACECalculator.
     """
 
     def __init__(self, d3_kwargs=None, skin=0.0, every=1, delay=0, check=True,
-                 **mace_kwargs):
+                 compile_d3=False, edge_capacity=None, stable_n=20, **mace_kwargs):
         super().__init__(**mace_kwargs)
+
+        # Opt-in compiled (CUDA-graph) energy+forces path; see calculate().
+        self.compile_d3 = compile_d3
+        self._edge_capacity = edge_capacity
+        self._stable_n = int(stable_n)
+        self._stable_calls = 0
+        self._d3_compiled = None
+        self.d3_compile_resets = 0   # times the compiled D3 wrapper was (re)created (cell change, capacity growth)
 
         self.d3_kwargs = d3_kwargs if d3_kwargs is not None else {}
         self.d3_model = None
@@ -142,6 +157,55 @@ class MACEFourierD3Calculator(MACECalculator):
                 **self.d3_kwargs
             )
 
+    def _d3_energy_forces(self, positions, edge_index, unit_shifts, cell):
+        """D3 energy (eV) and forces (eV/A) by autograd w.r.t. positions only.
+
+        Inputs must not require grad; the shifts are formed inside so the whole
+        position- and cell-dependent work is part of the compiled region.
+        """
+        positions = positions.detach().requires_grad_(True)
+        energy_ev = self.d3_model(positions=positions, edge_index=edge_index,
+                                  shifts=torch.matmul(unit_shifts, cell)) * self.HARTREE_TO_EV
+        (grad_pos,) = torch.autograd.grad(energy_ev, (positions,))
+        return energy_ev.detach(), -grad_pos
+
+    def _pad_edges(self, edge_index, unit_shifts):
+        """Pad to a fixed capacity with zero-shift self-pairs (0, 0).
+
+        Edges are only consumed by the coordination numbers; the dispersion
+        energy itself is a k-space sum and never sees the edge list. In the CN a
+        zero-distance pair is excluded by the mask (r > 1e-6) and its distance is
+        clamped before any division, so padding adds exactly zero to the energy
+        and a finite, zero contribution to the forces. Growing the capacity drops
+        the compiled wrapper.
+        """
+        n_edges = edge_index.shape[1]
+        if self._edge_capacity is None or n_edges > self._edge_capacity:
+            self._edge_capacity = int(1.25 * max(n_edges, 1)) + 1
+            self._d3_compiled = None
+        pad = self._edge_capacity - n_edges
+        edge_index = torch.cat(
+            [edge_index, edge_index.new_zeros(2, pad)], dim=1)
+        unit_shifts = torch.cat(
+            [unit_shifts, unit_shifts.new_zeros(pad, 3)], dim=0)
+        return edge_index, unit_shifts
+
+    def _d3_backward(self, energy_hartree, positions_d3, strain):
+        """Energy (eV), forces and optional stress from an eager D3 energy."""
+        energy_ev = energy_hartree * self.HARTREE_TO_EV
+        if strain is not None:
+            # Backpropagate to get forces (dE/dpos) and stress (dE/dstrain)
+            grad_pos, grad_strain = torch.autograd.grad(energy_ev, (positions_d3, strain))
+            # Stress tensor: (1/Omega) * dE/dstrain, converted from Bohr^3 to Å^3
+            d3_stress_3x3 = (
+                grad_strain
+                / self.d3_model.volume * (self.angstrom_to_bohr ** 3)
+            ).detach().cpu().numpy()
+        else:
+            (grad_pos,) = torch.autograd.grad(energy_ev, (positions_d3,))
+            d3_stress_3x3 = None
+        return energy_ev, -grad_pos.detach().cpu().numpy(), d3_stress_3x3
+
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         """Compute MACE energy/forces/stress and add Fourier-D3 dispersion on top.
 
@@ -170,21 +234,35 @@ class MACEFourierD3Calculator(MACECalculator):
         batch = self._cached_batch
         cnfunc = self.d3_kwargs.get('cnfunc', 'smooth_cut')
 
-        # Set up strained positions and cell for stress computation via autograd
+        # Stress needs the strain trick; energy and forces only need d/dpositions.
+        need_stress = "stress" in (properties or [])
+
         cell_d3 = batch["cell"].clone().detach().to(dtype=self.d3_model.dtype)
-
-        strain = torch.zeros(3, 3, dtype=self.d3_model.dtype, device=self.device)
-        strain.requires_grad_(True)
-
-        # Strained cell: cell' = cell + strain @ cell  (infinitesimal deformation)
-        strained_cell = cell_d3 + torch.einsum("ab,Ab->Aa", strain, cell_d3)
-        self.d3_model._update_cell(strained_cell)
-
         positions_d3 = batch["positions"].clone().detach().to(dtype=self.d3_model.dtype)
         positions_d3.requires_grad_(True)
 
-        # Apply the same strain to positions: pos' = pos + strain @ pos
-        strained_pos = positions_d3 + torch.einsum("ab,ib->ia", strain, positions_d3)
+        if need_stress:
+            # Strain tensor trick: d(energy)/d(strain) gives the stress tensor.
+            strain = torch.zeros(3, 3, dtype=self.d3_model.dtype, device=self.device)
+            strain.requires_grad_(True)
+            # Strained cell: cell' = cell + strain @ cell  (infinitesimal deformation)
+            cell_eval = cell_d3 + torch.einsum("ab,Ab->Aa", strain, cell_d3)
+            # Apply the same strain to positions: pos' = pos + strain @ pos
+            pos_eval = positions_d3 + torch.einsum("ab,ib->ia", strain, positions_d3)
+        else:
+            # No strain graph; _update_cell is a no-op when the cell is unchanged.
+            cell_eval = cell_d3
+            pos_eval = positions_d3
+        cell_buffer_before = self.d3_model.cell
+        self.d3_model._update_cell(cell_eval)
+        if self.d3_model.cell is cell_buffer_before:
+            self._stable_calls += 1        # unchanged cell: no rebuild happened
+        else:
+            self._stable_calls = 0         # rebuilt (new cell or stress call)
+            self._d3_compiled = None       # never replay a graph captured for old buffers
+
+        use_compiled = (self.compile_d3 and not need_stress and cnfunc == 'smooth_cut'
+                        and self._stable_calls >= self._stable_n)
 
         # Compute Fourier-D3 energy
         if cnfunc == 'smooth_cut':
@@ -197,31 +275,34 @@ class MACEFourierD3Calculator(MACECalculator):
                 edge_index, unit_shifts = self.neighbor_list.get(atoms)
                 unit_shifts = unit_shifts.to(dtype=self.d3_model.dtype)
 
-            strained_shifts = torch.matmul(unit_shifts, strained_cell)
-
-            energy_hartree = self.d3_model(
-                positions=strained_pos,
-                edge_index=edge_index,
-                shifts=strained_shifts,
-            )
+            if use_compiled:
+                edge_index, unit_shifts = self._pad_edges(edge_index, unit_shifts)
+                if self._d3_compiled is None:
+                    self._d3_compiled = torch.compile(self._d3_energy_forces,
+                                                      mode="reduce-overhead")
+                    self.d3_compile_resets += 1
+                d3_e_t, d3_f_t = self._d3_compiled(
+                    pos_eval.detach(), edge_index, unit_shifts, cell_eval.detach())
+                energy_hartree = None
+            else:
+                energy_hartree = self.d3_model(
+                    positions=pos_eval,
+                    edge_index=edge_index,
+                    shifts=torch.matmul(unit_shifts, cell_eval),
+                )
         elif cnfunc == 'd4':
             # D4 CN is computed entirely in k-space; no edge_index or shifts needed
-            energy_hartree = self.d3_model(positions=strained_pos)
+            energy_hartree = self.d3_model(positions=pos_eval)
         else:
             raise ValueError(f"Unknown cnfunc '{cnfunc}'. Expected 'smooth_cut' or 'd4'.")
 
-        energy_ev = energy_hartree * self.HARTREE_TO_EV
-
-        # Backpropagate to get forces (dE/dpos) and stress (dE/dstrain)
-        energy_ev.backward()
-
-        d3_forces = -positions_d3.grad.detach().cpu().numpy()
-
-        # Stress tensor: (1/Omega) * dE/dstrain, converted from Bohr^3 to Å^3
-        d3_stress_3x3 = (
-            strain.grad
-            / self.d3_model.volume * (self.angstrom_to_bohr ** 3)
-        ).detach().cpu().numpy()
+        if cnfunc == 'smooth_cut' and use_compiled:
+            energy_ev = d3_e_t.clone()
+            d3_stress_3x3 = None
+            d3_forces = d3_f_t.detach().cpu().numpy()
+        else:
+            energy_ev, d3_forces, d3_stress_3x3 = self._d3_backward(
+                energy_hartree, positions_d3, strain if need_stress else None)
 
         # Add D3 contributions to the MACE results already stored in self.results
         d3_e = energy_ev.item()
@@ -232,7 +313,12 @@ class MACEFourierD3Calculator(MACECalculator):
         self.results["forces"] += d3_forces
 
         if "stress" in self.results:
-            d3_stress_voigt = full_3x3_to_voigt_6_stress(d3_stress_3x3)
-            self.results["stress"] += d3_stress_voigt
+            if d3_stress_3x3 is None:
+                # Stress was not requested, so its D3 part was not computed. Drop the
+                # MACE-only value so a later get_stress() recomputes the full stress.
+                del self.results["stress"]
+            else:
+                d3_stress_voigt = full_3x3_to_voigt_6_stress(d3_stress_3x3)
+                self.results["stress"] += d3_stress_voigt
 
         self._cached_batch = None
