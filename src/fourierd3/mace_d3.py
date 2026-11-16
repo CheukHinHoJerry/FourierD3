@@ -157,11 +157,15 @@ class MACEFourierD3Calculator(MACECalculator):
                 **self.d3_kwargs
             )
 
-    def _d3_energy_forces(self, positions, edge_index, shifts):
-        """D3 energy (eV) and forces (eV/A) by autograd w.r.t. positions only."""
+    def _d3_energy_forces(self, positions, edge_index, unit_shifts, cell):
+        """D3 energy (eV) and forces (eV/A) by autograd w.r.t. positions only.
+
+        Inputs must not require grad; the shifts are formed inside so the whole
+        position- and cell-dependent work is part of the compiled region.
+        """
         positions = positions.detach().requires_grad_(True)
         energy_ev = self.d3_model(positions=positions, edge_index=edge_index,
-                                  shifts=shifts) * self.HARTREE_TO_EV
+                                  shifts=torch.matmul(unit_shifts, cell)) * self.HARTREE_TO_EV
         (grad_pos,) = torch.autograd.grad(energy_ev, (positions,))
         return energy_ev.detach(), -grad_pos
 
@@ -274,7 +278,7 @@ class MACEFourierD3Calculator(MACECalculator):
                                                       mode="reduce-overhead")
                     self.d3_compile_resets += 1
                 d3_e_t, d3_f_t = self._d3_compiled(
-                    pos_eval, edge_index, torch.matmul(unit_shifts, cell_eval))
+                    pos_eval.detach(), edge_index, unit_shifts, cell_eval.detach())
                 energy_hartree = None
             else:
                 energy_hartree = self.d3_model(
