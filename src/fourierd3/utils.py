@@ -113,6 +113,24 @@ def load_en() -> torch.Tensor:
     return torch.load(data_dir / 'en.pt', weights_only=True)
 
 
+def load_r0ab(types: List) -> torch.Tensor:
+    """Load the DFT-D3 zero-damping pairwise cutoff radii R0_{Z_i Z_j} (Angstrom) for the given species.
+
+    The radii (Grimme et al., J. Chem. Phys. 132, 154104 (2010)) set the onset of the zero-damping
+    function f_n(r) = 1 / (1 + 6 (r / (s_r,n R0))^(-alpha_n)). They are stored as a packed lower triangle
+    over Z = 1..103 in `data/r0ab_d3_zero.txt` (see the file header for provenance).
+
+    Returns:
+        r0ab: (n_species, n_species) tensor in Angstrom for the given atomic numbers.
+    """
+    with open(data_dir / 'r0ab_d3_zero.txt') as f:
+        packed = np.array([float(x) for line in f if not line.startswith('#') for x in line.split()])
+    z = np.asarray(types, dtype=np.int64)
+    i = np.maximum.outer(z, z)
+    j = np.minimum.outer(z, z)
+    return torch.tensor(packed[j - 1 + i * (i - 1) // 2])
+
+
 def load_rcov_cn() -> torch.Tensor:
     """Load covalent radii R^cov_Z used specifically for the D4 CN pair potential.
 

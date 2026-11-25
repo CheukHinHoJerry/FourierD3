@@ -5,7 +5,7 @@ import torch
 from numpy import unique
 from torchpme.lib.kvectors import get_ns_mesh, generate_kvectors_for_ewald
 
-from fourierd3.utils import decomp, load_rcov, load_cnref, safe_det_3x3
+from fourierd3.utils import decomp, load_rcov, load_cnref, load_r0ab, safe_det_3x3
 from fourierd3.pair_pot import D3Potential, CNPotential
 from fourierd3.kspace_filter_d3 import KSpaceFilterD3, KSpaceFilterCN
 from fourierd3.mesh_interpolator_d3 import MeshInterpolatorD3
@@ -47,6 +47,7 @@ class FourierD3(torch.nn.Module):
         dtype:               torch dtype.
         method:              reciprocal-space method: 'spme', 'pme', or 'ewald'.
         params:              BJ damping params [s6, s8, a1, a2]; overrides xcfunc defaults.
+                             Only used for damping='bj'.
         cnfunc:              CN function: 'smooth_cut' or 'd4'.
         interpolation_nodes: B-spline order for PME/SPME interpolation.
         k_cutoff:            reciprocal-space cutoff in Å^-1 for Ewald summation.
@@ -54,6 +55,22 @@ class FourierD3(torch.nn.Module):
         cncorr:              optional affine correction to CN values: CN' = a*CN + b,
                              shape (n_species, 2), with columns [b, a].
         verbose:             print rank and mesh info during initialization.
+        damping:             'bj' (Becke-Johnson, default) or 'zero' (Grimme 2010 zero damping, two-body).
+        zero_params:         zero-damping parameters {'s6', 'rs6', 's8', 'rs8', 'alpha'}; required for
+                             damping='zero' (e.g. revPBE: s6=1.0, rs6=0.923, s8=1.010, rs8=1.0, alpha=14).
+        r_zero:              real-space cutoff in Å for the zero-damping correction (damping='zero' only);
+                             the neighbour list passed to `forward` must cover max(r_cut, r_zero).
+        zero_split:          (a1, a2) of the smooth BJ reference used to split the zero-damped sum
+                             (damping='zero' only; the result does not depend on it beyond the r_zero truncation).
+
+    Zero damping (damping='zero'):
+        E = -1/2 sum_{i,j} C6_ij [ s6 f6(r)/r^6 + 3 sqrt(Q_i Q_j) s8 f8(r)/r^8 ],
+        f_n(r) = 1 / (1 + 6 (r / (s_r,n R0_ij))^(-alpha_n)),  alpha_6 = alpha, alpha_8 = alpha + 2,
+        with R0_ij the pairwise D3 cutoff radii (`data/r0ab_d3_zero.txt`) and the same C6 / C8 as the BJ path.
+        The zero-damped pair potential is too steep (alpha = 14) for the particle mesh, so the sum is split:
+        the reciprocal-space BJ machinery evaluates a smooth BJ-damped reference with the SAME s6 and s8
+        (identical C6/r^6 + C8/r^8 tail), and the remainder phi_zero - phi_BJ, which decays as r^-12,
+        is summed in real space over the neighbour list up to r_zero.
     """
 
     def __init__(
@@ -73,7 +90,11 @@ class FourierD3(torch.nn.Module):
         k_cutoff: float = 10.0,
         r_cut: float = 6.0,
         cncorr: Optional[torch.tensor] = None,
-        verbose = True
+        verbose = True,
+        damping: str = 'bj',
+        zero_params: Optional[dict] = None,
+        r_zero: float = 20.0,
+        zero_split = (0.5238, 3.5016),
     ) -> None:
         super().__init__()
 
@@ -169,6 +190,18 @@ class FourierD3(torch.nn.Module):
         self.register_buffer('factor_cn', torch.tensor(4.0/3.0, dtype=dtype, device=device))
         self.register_buffer('logit_scale', torch.tensor(-4.0, dtype=dtype, device=device))
 
+        # --- Zero damping: the k-space part evaluates a BJ-damped reference with the zero s6, s8 ---
+        if damping not in ('bj', 'zero'):
+            raise ValueError(f"damping must be 'bj' or 'zero', got {damping!r}")
+        self.damping = damping
+        if damping == 'zero':
+            if zero_params is None:
+                raise ValueError("damping='zero' requires zero_params {'s6', 'rs6', 's8', 'rs8', 'alpha'}")
+            if cnfunc != 'smooth_cut':
+                raise NotImplementedError("damping='zero' is implemented for cnfunc='smooth_cut' only")
+            self.zero_params = {k: float(zero_params[k]) for k in ('s6', 'rs6', 's8', 'rs8', 'alpha')}
+            params = [self.zero_params['s6'], self.zero_params['s8'], zero_split[0], zero_split[1]]
+
         # --- BJ damping parameters [s6, s8, a1, a2] ---
         # D3(BJ) values from simple-dftd3 (assets/parameters.toml)
         if params is not None:
@@ -191,6 +224,16 @@ class FourierD3(torch.nn.Module):
 
         # Self-interaction term V_self: phi_{X,X}(r->0) per species, shape (n_species, 1)
         self.register_buffer('selfcont', self.potential.selfcont)
+
+        if damping == 'zero':
+            # Pairwise zero-damping radii R0_{X,Y} (Bohr), sqrt(Q_X Q_Y) and the BJ-reference R0_{X,Y} (Bohr)
+            r0ab = load_r0ab(species_unique).to(device=device, dtype=dtype) * angstrom_to_bohr
+            self.register_buffer('r0ab', r0ab)
+            self.register_buffer('zero_qq', self.potential.QzQz.to(device=device, dtype=dtype))
+            self.register_buffer('zero_rbj', self.potential.Rab.reshape(self.n_species, self.n_species))
+            self.r_zero = r_zero * angstrom_to_bohr
+            # smooth switch-off of the real-space correction over the last 2 Å (continuous E, F, stress)
+            self.r_zero_on = (r_zero - 2.0) * angstrom_to_bohr
 
         if method == 'pme' or method == 'spme':
             # Determine mesh size to match the requested mesh_spacing
@@ -598,4 +641,49 @@ class FourierD3(torch.nn.Module):
         # E_D3 = -(1/(2*Omega)) * E_k + (1/2) * V_self
         energy = energy / (-2 * self.volume) + vself / 2
 
+        # --- Step 7 (damping='zero' only): real-space zero-minus-BJ correction ---
+        if self.damping == 'zero':
+            energy = energy + self.compute_zero_correction(positions, edge_index, shifts, c6)
+
         return energy
+
+    def compute_zero_correction(self, positions: torch.Tensor, edge_index: torch.Tensor,
+                                shifts: torch.Tensor, c6: torch.Tensor) -> torch.Tensor:
+        """Real-space part of the zero-damped D3 energy (damping='zero').
+
+        Sums  -1/2 * C6_ij * [phi_zero(r) - phi_BJref(r)] * s(r)  over the directed neighbour-list pairs with
+        r <= r_zero, s(r) = 1 below r_zero - 2 Å and a cosine switch to 0 at r_zero (the remainder decays as r^-12,
+        so the switch only removes a negligible tail but keeps energy, forces and stress continuous), where
+        C6_ij = sum_r lambda_r C^6_{r,i} C^6_{r,j} is the same rank-decomposed C6 as the
+        reciprocal-space part, and
+
+            phi_zero(r)  = s6 f6(r)/r^6 + 3 sqrt(Q_X Q_Y) s8 f8(r)/r^8,
+            f_n(r)       = 1 / (1 + 6 (r / (s_r,n R0_{X,Y}))^(-alpha_n)),
+            phi_BJref(r) = s6 / (r^6 + R0BJ^6) + 3 sqrt(Q_X Q_Y) s8 / (r^8 + R0BJ^8).
+
+        Args:
+            positions:  atomic positions in Bohr, shape (n_atoms, 3).
+            edge_index: neighbour list covering r_zero, shape (2, n_edges).
+            shifts:     periodic image shift vectors in Bohr, shape (n_edges, 3).
+            c6:         per-atom rank coefficients C^6_{r,i}, shape (n_atoms, n_rank).
+
+        Returns:
+            energy correction in Hartree (scalar).
+        """
+        source, target = edge_index
+        r = torch.linalg.norm(positions[target] - positions[source] + shifts, dim=-1)
+        keep = (r > 1e-6) & (r <= self.r_zero)
+        source, target, r = source[keep], target[keep], r[keep]
+        c6ij = torch.einsum('er,r,er->e', c6[source], self.eigs, c6[target])
+        sx, sy = self.species[source], self.species[target]
+        qq, r0, rbj = self.zero_qq[sx, sy], self.r0ab[sx, sy], self.zero_rbj[sx, sy]
+        zp = self.zero_params
+        f6 = 1.0 / (1.0 + 6.0 * torch.pow(r / (zp['rs6'] * r0), -zp['alpha']))
+        f8 = 1.0 / (1.0 + 6.0 * torch.pow(r / (zp['rs8'] * r0), -(zp['alpha'] + 2.0)))
+        r6 = torch.pow(r, 6)
+        r8 = torch.pow(r, 8)
+        phi_zero = zp['s6'] * f6 / r6 + 3.0 * qq * zp['s8'] * f8 / r8
+        phi_bj = zp['s6'] / (r6 + torch.pow(rbj, 6)) + 3.0 * qq * zp['s8'] / (r8 + torch.pow(rbj, 8))
+        x = torch.clamp((r - self.r_zero_on) / (self.r_zero - self.r_zero_on), 0.0, 1.0)
+        switch = 0.5 * (1.0 + torch.cos(math.pi * x))
+        return -0.5 * torch.sum(c6ij * (phi_zero - phi_bj) * switch)
