@@ -35,6 +35,12 @@ class FourierD3ASECalculator(Calculator):
         every: only consider rebuilding the list every `every` calls.
         delay: never rebuild until `delay` calls after the last rebuild.
         check: rebuild only when atoms may have left the buffer region.
+        damping: 'bj' (default) or 'zero' (Grimme 2010 zero damping, two-body); see FourierD3.
+        zero_params: zero-damping parameters {'s6', 'rs6', 's8', 'rs8', 'alpha'} (damping='zero').
+        r_zero: real-space cutoff in Å of the zero-damping correction (damping='zero'); the
+               neighbour list is then built at max(r_cut, r_zero). The CN is unchanged because
+               contributions beyond `r_cut` are masked out.
+        zero_split: (a1, a2) of the smooth BJ reference used to split the zero-damped sum.
     """
 
     implemented_properties = ["energy", "forces", "stress"]
@@ -57,6 +63,10 @@ class FourierD3ASECalculator(Calculator):
         every: int = 1,
         delay: int = 0,
         check: bool = True,
+        damping: str = 'bj',
+        zero_params = None,
+        r_zero: float = 20.0,
+        zero_split = (0.5238, 3.5016),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -80,10 +90,17 @@ class FourierD3ASECalculator(Calculator):
         self.interpolation_nodes = interpolation_nodes
         self.dtype = dtype
 
+        self.damping = damping
+        self.zero_params = zero_params
+        self.r_zero = float(r_zero)
+        self.zero_split = zero_split
+        # The zero-damping correction needs pairs up to r_zero; the CN masks everything beyond r_cut
+        nlist_cutoff = self.r_cut if damping == 'bj' else max(self.r_cut, self.r_zero)
+
         # CN neighbour list. With skin == 0 this rebuilds on every call, which
         # is the historical behaviour; with skin > 0 it caches across steps.
         self.neighbor_list = SkinNeighborList(
-            cutoff=self.r_cut,
+            cutoff=nlist_cutoff,
             skin=skin,
             every=every,
             delay=delay,
@@ -121,7 +138,11 @@ class FourierD3ASECalculator(Calculator):
             k_cutoff=self.k_cutoff,
             verbose=self.verbose,
             r_cut=self.r_cut,
-            dtype=self.dtype
+            dtype=self.dtype,
+            damping=self.damping,
+            zero_params=self.zero_params,
+            r_zero=self.r_zero,
+            zero_split=self.zero_split,
         )
 
     def _build_graph(self, atoms, rcut=None):

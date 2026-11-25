@@ -63,6 +63,32 @@ conf.get_forces()
 conf.get_stress()
 ```
 
+## D3 zero damping (`damping='zero'`)
+
+Besides the default Becke-Johnson (BJ) damping, the original zero damping of
+Grimme et al. (J. Chem. Phys. 132, 154104 (2010)) is available, two-body only (no ATM term):
+
+```python
+calc = FourierD3ASECalculator(
+    r_cut=6.0, method="spme", device=torch.device("cpu"), dtype=torch.float64,
+    damping="zero",
+    zero_params={"s6": 1.0, "rs6": 0.923, "s8": 1.010, "rs8": 1.0, "alpha": 14.0},  # revPBE
+    r_zero=20.0,
+)
+```
+
+with f_n(r) = 1 / (1 + 6 (r / (s_r,n R0_AB))^(-alpha_n)), alpha_6 = alpha, alpha_8 = alpha + 2, the pairwise
+radii R0_AB of the D3 program (`src/fourierd3/data/r0ab_d3_zero.txt`, provenance in its header) and the same
+C6 / C8 = 3 sqrt(Q_A Q_B) C6 as the BJ path. The zero-damped pair potential is too steep to be represented
+on the particle mesh, so the sum is split: the existing reciprocal-space BJ machinery evaluates a smooth
+BJ-damped reference with the same s6 and s8 (hence the same C6/r^6 + C8/r^8 tail), and the remainder, which
+decays as r^-12, is summed in real space up to `r_zero` (default 20 Å, smoothly switched off over the last 2 Å; converged to < 1e-6 eV/atom even for dense metals) over the neighbour list (built at max(r_cut, r_zero);
+the CN is unchanged because it is masked beyond r_cut). Forces and stress follow by automatic differentiation.
+`damping='bj'` (the default) is unchanged. `MACEFourierD3Calculator` does not expose zero damping yet.
+
+Tests: `pytest tests/` (BJ regression against the previous release, hand-evaluated pair energies,
+finite-difference forces and stress, `r_zero` convergence).
+
 ## [Experimental] Using skin-type neighborlist
 
 Rebuilding the coordination-number neighbour list at every step can be slow,
