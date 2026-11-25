@@ -34,7 +34,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 fourierd3 = ["data/*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
