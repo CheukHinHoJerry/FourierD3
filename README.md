@@ -86,8 +86,6 @@ decays as r^-12, is summed in real space up to `r_zero` (default 20 Å, smoothly
 the CN is unchanged because it is masked beyond r_cut). Forces and stress follow by automatic differentiation.
 `damping='bj'` (the default) is unchanged. `MACEFourierD3Calculator` does not expose zero damping yet.
 
-Tests: `pytest tests/` (BJ regression against the previous release, hand-evaluated pair energies,
-finite-difference forces and stress, `r_zero` convergence).
 
 ## [Experimental] Using skin-type neighborlist
 
